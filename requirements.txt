@@ -1,4 +1,11 @@
-# Conversor PDF -> DOCX
+# Conversor PDF -> DOCX com OCR híbrido
+
 # Engine de conversão que preserva layout, tabelas e imagens.
-# pdf2docx traz o PyMuPDF (fitz) como dependência transitiva.
+# Traz o PyMuPDF (fitz) como dependência transitiva (usado também na
+# detecção de texto nativo).
 pdf2docx==0.5.13
+
+# Pré-processamento OCR ("Sandwich PDF"): encapsula o Tesseract e usa o
+# Ghostscript. ATENÇÃO: exige os binários de sistema Tesseract OCR e
+# Ghostscript instalados separadamente (ver README).
+ocrmypdf==17.8.0
