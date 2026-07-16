@@ -1,22 +1,29 @@
-# Conversor PDF → DOCX (Document Layout Analysis)
+# Conversor PDF (Document Layout Analysis)
 
-Rotina de backend, de nível de produção, para converter em lote **PDFs "chapados"**
+Rotina de backend, de nível de produção, para processar em lote **PDFs "chapados"**
 (páginas exportadas inteiramente como imagem, misturando texto instrucional e
-prints de tela) em **DOCX nativo e editável**.
+prints de tela). O mesmo pipeline de Visão Computacional atende **dois modos de
+saída** (`--mode`):
+
+- **`docx`** (padrão) — reconstrói um **DOCX nativo e editável** por PDF.
+- **`json`** — extrai apenas o **texto** (OCR) de todos os PDFs e agrega tudo em um
+  **único arquivo JSON** (uma lista de dicionários), pronto para ingestão de dados
+  em etapas futuras (base de conhecimento).
 
 Em vez de extrair texto ou sobrepor uma camada invisível, o pipeline **fatia cada
-página e reconstrói o documento do zero**. A partir da **v3.0.0**, o *"o que é
-texto x o que é print"* deixou de ser adivinhado por heurísticas e passou a ser
-decidido por um **modelo de Visão Computacional** (DocLayout-YOLO): a rede detecta
-as regiões da página, aplicamos OCR apenas nas regiões de texto e recortamos as
-regiões de imagem, remontando o fluxo original — mas agora com o texto 100%
-editável no Word e os prints preservados como imagem.
+página**. A partir da **v3.0.0**, o *"o que é texto x o que é print"* deixou de ser
+adivinhado por heurísticas e passou a ser decidido por um **modelo de Visão
+Computacional** (DocLayout-YOLO): a rede detecta as regiões da página, aplicamos
+OCR apenas nas regiões de texto e recortamos as regiões de imagem. No modo `docx`,
+o fluxo é remontado com o texto 100% editável no Word e os prints preservados como
+imagem; no modo `json`, as regiões de imagem são ignoradas e só o texto é retido.
 
 ---
 
 ## Índice
 
 - [Como funciona (pipeline DLA)](#como-funciona-pipeline-dla)
+- [Modos de saída (DOCX × JSON)](#modos-de-saída-docx--json)
 - [O modelo de IA](#o-modelo-de-ia)
 - [Arquitetura](#arquitetura)
 - [Requisitos](#requisitos)
@@ -61,6 +68,49 @@ O tratamento com OpenCV (escala de cinza, **inversão de fundo escuro** e
 *thresholding* Otsu) é aplicado **somente na cópia** do recorte de texto enviada
 ao Tesseract, para elevar a precisão em PDFs com fundo escuro/cinza. A imagem
 original colorida é preservada intacta para o recorte dos prints.
+
+## Modos de saída (DOCX × JSON)
+
+Os Passos 1 e 2 (rasterização + Document Layout Analysis) são **compartilhados**;
+o que muda é o Passo 3. Escolha com `--mode`:
+
+| | `--mode docx` (padrão) | `--mode json` |
+| --- | --- | --- |
+| **Saída** | Um `.docx` por PDF, no diretório `--dst`. | **Um único** arquivo JSON (`--json-file`) com **todos** os PDFs. |
+| **Regiões de TEXTO** | OCR → parágrafo editável no Word. | OCR → texto concatenado. |
+| **Regiões de IMAGEM** | Recortadas e reinseridas como imagem. | **Ignoradas** (sem recorte). |
+| **Escrita em disco** | Cada worker grava seu `.docx`. | Workers **não** gravam; a *main thread* faz **um** `json.dump` no fim do lote. |
+| **Idempotência** | Ignora `.docx` já existentes (`--force` reprocessa). | Sempre regrava o arquivo agregado. |
+
+### Modo JSON — base de conhecimento
+
+No `--mode json`, cada PDF vira uma entrada e o lote inteiro é agregado em uma
+lista de dicionários:
+
+```json
+[
+    {
+        "Titulo": "nome_do_arquivo_sem_extensao",
+        "Resolucao": "texto concatenado de todas as regiões de texto..."
+    }
+]
+```
+
+- **`Titulo`** = nome do arquivo de origem, sem a extensão `.pdf`.
+- **`Resolucao`** = texto de todas as regiões de TEXTO, na ordem de leitura.
+- **Falhas são não-fatais:** se um PDF falha, sua entrada ainda entra na lista com
+  o erro no campo `Resolucao` (prefixado por `ERRO: `); o lote e a gravação seguem.
+- **Escrita segura para multiprocessamento:** como o `ProcessPoolExecutor` não pode
+  ter vários processos escrevendo no mesmo arquivo, os workers apenas *retornam* seu
+  dicionário. A *main thread* coleta todos os retornos e grava **uma única vez**
+  (`ensure_ascii=False`, `indent=4`). As entradas são ordenadas por título para uma
+  saída estável.
+
+```powershell
+python main.py --mode json                                   # -> ./base_conhecimento.json
+python main.py --mode json --json-file .\saida\kb.json       # caminho customizado
+python main.py --mode json --workers 4 --dpi 400             # paraleliza a extração
+```
 
 ## O modelo de IA
 
@@ -114,9 +164,9 @@ Código modular, no pacote `conversor/`, com responsabilidades isoladas:
 | `detector.py` | **Passo 2 (IA)**: DocLayout-YOLO — device, download dos pesos, inferência, mapeamento. |
 | `ocr.py` | Pré-processamento de imagem e OCR por região (pytesseract). |
 | `layout.py` | **Passo 2**: orquestra detecção + OCR das regiões + ordem de leitura. |
-| `docx_builder.py` | **Passo 3**: reconstrução do DOCX nativo (python-docx). |
-| `pipeline.py` | Orquestra os 3 passos de **um** arquivo (worker, fail-safe). |
-| `main.py` | CLI, descoberta, planejamento e orquestração do lote. |
+| `docx_builder.py` | **Passo 3 (docx)**: reconstrução do DOCX nativo (python-docx). |
+| `pipeline.py` | Workers fail-safe de **um** arquivo: `convert_single` (→DOCX) e `extract_single_json` (→dict de texto). |
+| `main.py` | CLI, descoberta e orquestração do lote (`run_batch` p/ DOCX; `run_batch_json` p/ o JSON agregado). |
 
 ## Requisitos
 
@@ -180,12 +230,15 @@ python main.py --dpi 400 --verbose # mais resolução (OCR melhor, mais lento)
 python main.py --ocr-lang eng      # idioma do Tesseract
 python main.py --workers 4 --force # paraleliza e reprocessa tudo
 python main.py --device cpu        # força CPU mesmo com GPU disponível
+python main.py --mode json         # extrai texto -> ./base_conhecimento.json
 ```
 
 | Flag | Descrição | Padrão |
 | --- | --- | --- |
+| `--mode` | Saída: `docx` (um .docx por PDF) ou `json` (texto agregado num único arquivo). | `docx` |
+| `--json-file` | Arquivo JSON agregado de saída (só no `--mode json`). | `base_conhecimento.json` |
 | `--src` | Diretório de origem dos PDFs. | `pdf` |
-| `--dst` | Diretório de destino dos DOCX. | `docx` |
+| `--dst` | Diretório de destino dos DOCX (só no `--mode docx`). | `docx` |
 | `--workers` | Nº de processos paralelos. | nº de CPUs (em GPU: `1`, p/ não estourar a VRAM) |
 | `--force` | Reprocessa/sobrescreve arquivos já convertidos. | desativado |
 | `--dpi` | Resolução de rasterização das páginas. | `300` |
@@ -232,7 +285,8 @@ ConversorPdfDocx/
 ├── .gitignore
 ├── contexto/           # handoffs de estado do projeto
 ├── pdf/                # ORIGEM — coloque aqui os PDFs a converter
-└── docx/               # DESTINO — os .docx convertidos são gravados aqui
+├── docx/               # DESTINO (modo docx) — os .docx convertidos vão aqui
+└── base_conhecimento.json  # DESTINO (modo json) — base agregada de texto
 ```
 
 ## Limitações conhecidas
@@ -250,6 +304,20 @@ ConversorPdfDocx/
   feche-os antes de reprocessar com `--force`.
 
 ## Histórico de versões
+
+### v3.2.0 — Modo de extração JSON (base de conhecimento agregada)
+- **Novo `--mode json`:** extrai apenas o texto (OCR) de todos os PDFs e agrega em
+  **um único** arquivo JSON (lista de `{"Titulo", "Resolucao"}`), pensado para
+  ingestão de dados em etapas futuras. O modo `docx` original segue **intocado** e é
+  o padrão.
+- **Novo `--json-file`** (padrão `./base_conhecimento.json`): caminho do arquivo agregado.
+- **Regiões de IMAGEM ignoradas** no modo json (sem recortes) — só o texto é retido.
+- **Escrita thread-safe:** com `ProcessPoolExecutor`, os workers **não** escrevem em
+  disco; cada um *retorna* seu dicionário e a *main thread* faz **um** `json.dump`
+  (`ensure_ascii=False`, `indent=4`) ao final do lote. Falhas de um PDF viram uma
+  entrada com o erro no campo `Resolucao` (não derrubam o lote nem a gravação).
+- **Obsoleto:** a ideia anterior de salvar **centenas de arquivos JSON individuais**
+  foi substituída pela agregação em um único arquivo.
 
 ### v3.1.0 — Otimização de CPU e cache configurável
 - **Threads do torch por worker:** em CPU, cada worker fixa `núcleos ÷ workers`

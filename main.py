@@ -22,11 +22,20 @@ Características de produção:
     * Dependências (Poppler/Tesseract) detectadas automaticamente, com fallback
       local do projeto (.poppler/ e .tessdata/).
 
+Dois modos de saída (--mode):
+    * docx (padrão): reconstrói um .docx nativo/editável por PDF (fluxo acima).
+    * json: pula a reconstrução e os recortes de imagem; faz OCR apenas das
+      regiões de TEXTO, concatena o resultado e agrega TODOS os PDFs em um único
+      arquivo JSON (lista de {"Titulo", "Resolucao"}) para ingestão posterior.
+      A gravação é feita uma única vez pela main thread (seguro para o
+      ProcessPoolExecutor — os workers não tocam no disco).
+
 Uso:
     python main.py                       # ./pdf -> ./docx
     python main.py --dpi 400 --verbose
     python main.py --ocr-lang eng --workers 4 --force
     python main.py --device cpu          # força CPU mesmo com GPU disponível
+    python main.py --mode json           # extrai texto -> ./base_conhecimento.json
 
 Dependências de sistema (ver README): Poppler e Tesseract OCR.
 Dependências de IA (ver requirements.txt): doclayout-yolo, torch, huggingface_hub.
@@ -37,6 +46,7 @@ Autor: Engenharia HypeTecnologia
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -48,10 +58,14 @@ from typing import Iterable
 from conversor.config import (
     DEFAULT_DPI,
     DEFAULT_DST_DIR,
+    DEFAULT_JSON_FILE,
     DEFAULT_OCR_LANG,
     DEFAULT_SRC_DIR,
     DEFAULT_YOLO_CONF,
     DEFAULT_YOLO_IMGSZ,
+    DOCX_MODE,
+    JSON_ERROR_PREFIX,
+    JSON_MODE,
     LOG_FILE_NAME,
     SOURCE_SUFFIX,
     TARGET_SUFFIX,
@@ -66,7 +80,7 @@ from conversor.dependencies import (
     tesseract_available,
 )
 from conversor.detector import ensure_weights, resolve_device
-from conversor.pipeline import convert_single
+from conversor.pipeline import convert_single, extract_single_json
 
 logger = logging.getLogger("conversor_pdf_docx")
 
@@ -223,6 +237,78 @@ def summarize(results: list[ConversionResult]) -> dict[Status, int]:
 
 
 # ---------------------------------------------------------------------------
+# Orquestração do lote — modo JSON (extração agregada de texto)
+# ---------------------------------------------------------------------------
+
+
+def run_batch_json(
+    src_dir: Path, json_file: Path, workers: int, cfg: PipelineConfig
+) -> list[dict]:
+    """Extrai o texto de todos os PDFs e agrega em um único arquivo JSON.
+
+    Cada PDF é processado em um processo isolado (fail-safe) e devolve um dicionário
+    ``{"Titulo", "Resolucao"}``. Como o ``ProcessPoolExecutor`` impede múltiplos
+    processos de escreverem no mesmo arquivo com segurança, os workers **não** tocam
+    no disco: a main thread coleta o retorno de todos os futures em uma lista e faz
+    **um único** ``json.dump`` ao final do lote.
+    """
+    pdfs = discover_pdfs(src_dir)
+    if not pdfs:
+        logger.warning("Nenhum arquivo .pdf encontrado em: %s", src_dir)
+        return []
+
+    logger.info(
+        "Encontrados %d PDF(s) | modo: JSON | workers: %d | DPI: %d | saída: %s",
+        len(pdfs), workers, cfg.dpi, json_file.resolve(),
+    )
+
+    entries: list[dict] = []
+    completed = 0
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(extract_single_json, pdf, cfg): pdf for pdf in pdfs
+        }
+        for future in as_completed(future_map):
+            pdf = future_map[future]
+            try:
+                entry = future.result()
+            except Exception as exc:  # noqa: BLE001 - falha do próprio worker
+                entry = {
+                    "Titulo": pdf.stem,
+                    "Resolucao": (
+                        f"{JSON_ERROR_PREFIX}Processo worker falhou: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            completed += 1
+            _log_json_entry(entry, completed, len(pdfs))
+            entries.append(entry)
+
+    # Ordena por título (as_completed é não-determinístico) para uma saída estável.
+    entries.sort(key=lambda e: e["Titulo"].lower())
+
+    # Gravação única e atômica-por-lote na main thread (sem corrida entre processos).
+    json_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(json_file, "w", encoding="utf-8") as handle:
+        json.dump(entries, handle, ensure_ascii=False, indent=4)
+
+    return entries
+
+
+def _log_json_entry(entry: dict, index: int, total: int) -> None:
+    """Registra o resultado da extração de um único PDF (modo JSON)."""
+    progress = f"[{index}/{total}]"
+    resolucao = entry.get("Resolucao", "")
+    if resolucao.startswith(JSON_ERROR_PREFIX):
+        logger.error("%s [FALHA] %s :: %s", progress, entry["Titulo"], resolucao)
+    else:
+        logger.info(
+            "%s [OK] %s (%d caractere(s) extraído(s))",
+            progress, entry["Titulo"], len(resolucao),
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -233,10 +319,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Converte em lote PDFs para DOCX editável por Document Layout Analysis.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--mode", choices=[DOCX_MODE, JSON_MODE], default=DOCX_MODE,
+                        help="docx: gera um .docx por PDF; json: extrai o texto de "
+                             "todos os PDFs e agrega em um único arquivo JSON.")
+    parser.add_argument("--json-file", type=Path, default=Path(DEFAULT_JSON_FILE),
+                        help="Arquivo JSON agregado de saída (usado apenas no --mode json).")
     parser.add_argument("--src", type=Path, default=Path(DEFAULT_SRC_DIR),
                         help="Diretório de origem contendo os PDFs.")
     parser.add_argument("--dst", type=Path, default=Path(DEFAULT_DST_DIR),
-                        help="Diretório de destino para os DOCX.")
+                        help="Diretório de destino para os DOCX (usado apenas no --mode docx).")
     parser.add_argument("--workers", type=int, default=None,
                         help="Nº de processos paralelos (padrão: nº de CPUs).")
     parser.add_argument("--force", action="store_true",
@@ -300,9 +391,12 @@ def main(argv: list[str] | None = None) -> int:
             os.environ.get("HF_HOME", "<padrão>"),
         )
 
+    destino = args.json_file if args.mode == JSON_MODE else args.dst
     logger.info("=" * 70)
-    logger.info("Conversor PDF -> DOCX (Document Layout Analysis) iniciado")
-    logger.info("Origem: %s | Destino: %s", args.src.resolve(), args.dst.resolve())
+    logger.info(
+        "Conversor PDF (Document Layout Analysis) iniciado | modo: %s", args.mode
+    )
+    logger.info("Origem: %s | Destino: %s", args.src.resolve(), destino.resolve())
 
     # --- Dependências de sistema -------------------------------------------
     poppler_path = find_poppler(project_root)
@@ -385,6 +479,26 @@ def main(argv: list[str] | None = None) -> int:
         cpu_threads=cpu_threads,
     )
 
+    # --- Modo JSON: extração agregada de texto (não gera DOCX) -------------
+    if args.mode == JSON_MODE:
+        start = time.perf_counter()
+        entries = run_batch_json(args.src, args.json_file, workers=workers, cfg=cfg)
+        elapsed = time.perf_counter() - start
+
+        failures = sum(
+            1 for e in entries if e["Resolucao"].startswith(JSON_ERROR_PREFIX)
+        )
+        logger.info("-" * 70)
+        logger.info(
+            "Concluído em %.2fs | Extraídos: %d | Falhas: %d | Total: %d",
+            elapsed, len(entries) - failures, failures, len(entries),
+        )
+        if entries:
+            logger.info("Base de conhecimento gravada em: %s", args.json_file.resolve())
+        logger.info("=" * 70)
+        return 1 if failures > 0 else 0
+
+    # --- Modo DOCX (padrão): um .docx nativo por PDF -----------------------
     start = time.perf_counter()
     results = run_batch(args.src, args.dst, workers=workers, force=args.force, cfg=cfg)
     elapsed = time.perf_counter() - start
