@@ -22,6 +22,10 @@ pdf/*.pdf
 # Poppler portátil (binário do pdf2image; grande, específico da máquina).
 .poppler/
 
+# Cache dos modelos de IA (pesos do DocLayout-YOLO / HuggingFace / YOLO).
+# Grande e específico da máquina; o destino é configurado pelo .env.
+.models_cache/
+
 # Ferramentas de agentes / IDE
 .agents/
 .claude/

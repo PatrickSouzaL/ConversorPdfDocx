@@ -104,6 +104,19 @@ def _get_model(cfg: PipelineConfig):
     if _MODEL is not None and _MODEL_PATH == path:
         return _MODEL
 
+    # Otimização de CPU: fixa o nº de threads do torch DESTE worker. Com o
+    # ProcessPoolExecutor, sem isso cada worker tentaria usar todos os núcleos
+    # (N workers × N threads = oversubscription e thrashing). Só se aplica em CPU;
+    # em GPU o torch é irrelevante para o throughput da inferência.
+    if cfg.device == "cpu" and cfg.cpu_threads:
+        try:
+            import torch
+
+            torch.set_num_threads(cfg.cpu_threads)
+            logger.debug("torch.set_num_threads(%d) neste worker (CPU)", cfg.cpu_threads)
+        except Exception:  # noqa: BLE001 - ajuste de threads é best-effort
+            pass
+
     from doclayout_yolo import YOLOv10
 
     _MODEL = YOLOv10(path)

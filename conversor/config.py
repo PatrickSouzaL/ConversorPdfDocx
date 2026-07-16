@@ -18,6 +18,17 @@ LOG_FILE_NAME = "conversao.log"
 SOURCE_SUFFIX = ".pdf"
 TARGET_SUFFIX = ".docx"
 
+# --- Modos de operação ------------------------------------------------------
+# DOCX_MODE: reconstrói um .docx nativo por arquivo (comportamento original).
+# JSON_MODE: extrai apenas o texto (OCR) de cada PDF e agrega tudo em um único
+#            arquivo JSON (lista de dicionários) para ingestão em etapas futuras.
+DOCX_MODE = "docx"
+JSON_MODE = "json"
+DEFAULT_JSON_FILE = "base_conhecimento.json"
+# Prefixo que marca um erro no campo "Resolucao" de uma entrada JSON. Permite ao
+# orquestrador contar falhas e definir o exit code sem alterar o formato da saída.
+JSON_ERROR_PREFIX = "ERRO: "
+
 DEFAULT_OCR_LANG = "por+eng"
 DEFAULT_DPI = 300  # resolução de rasterização das páginas
 
@@ -75,6 +86,7 @@ class PipelineConfig:
     model_path: str | None = None     # caminho local dos pesos (pré-baixados no main)
     yolo_conf: float = DEFAULT_YOLO_CONF
     yolo_imgsz: int = DEFAULT_YOLO_IMGSZ
+    cpu_threads: int | None = None    # threads do torch por worker em CPU (None = padrão do torch)
 
     # --- OCR das regiões de texto ---
     min_conf: int = 40                # confiança mínima (0-100) p/ aceitar palavra do OCR
