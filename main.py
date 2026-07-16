@@ -1,36 +1,35 @@
 """
-Conversor de PDF para DOCX em lote com OCR híbrido (nível de produção).
+Conversor de PDF para DOCX em lote por Document Layout Analysis (DLA).
 
-Varre um diretório de origem (./pdf), torna o texto pesquisável quando
-necessário (via OCR "sandwich") e converte cada arquivo para .docx no diretório
-de destino (./docx), preservando o nome original.
+Ao contrário de uma extração/sanduíche simples, este pipeline "fatia" cada página
+e reconstrói o documento do zero:
 
-Pipeline híbrido (por arquivo):
-    Passo 0 (detecção): verifica se TODAS as páginas já possuem texto nativo.
-    Passo 1 (pré-processamento, condicional): se alguma página não tem texto
-        (documento escaneado / imagem plana), roda o ocrmypdf/Tesseract para
-        gerar um "Sandwich PDF" temporário — a camada visual original (prints de
-        tela) é preservada intacta e uma camada de texto invisível é sobreposta.
-        Páginas que já têm texto nativo NÃO são rasterizadas (--skip-text).
-    Passo 2 (conversão): alimenta o PDF (nativo ou sandwich) no pdf2docx para
-        gerar o .docx final, editável e pesquisável.
+    Passo 1 (rendering):  pdf2image/Poppler rasteriza cada página em alta resolução.
+    Passo 2 (layout+ocr): um modelo de Visão Computacional (DocLayout-YOLO) detecta
+        as regiões da página e as classifica como TEXTO (instrução) ou IMAGEM
+        (print de tela). Nas regiões de texto, o Tesseract lê a string limpa;
+        as regiões de imagem são recortadas da imagem original colorida.
+    Passo 3 (docx):       python-docx remonta um DOCX nativo, inserindo texto e
+        imagens na ordem de leitura — texto 100% editável, prints preservados.
 
 Características de produção:
-    * Fail-safe: falha em um arquivo (Tesseract, engine, PDF corrompido) não
-      interrompe o lote (isolamento por processo + try/except por arquivo).
+    * IA com fallback de hardware: usa GPU (CUDA) quando disponível, senão CPU.
+    * Fail-safe: falha em um arquivo não interrompe o lote (isolamento por processo).
     * Idempotência: arquivos já convertidos são ignorados (use --force).
-    * Filtro estrito: apenas arquivos com extensão .pdf (case-insensitive).
-    * Arquivos temporários seguros (tempfile) com limpeza garantida (finally).
-    * Paralelismo via ProcessPoolExecutor e logging para console + arquivo.
+    * Filtro estrito: apenas arquivos .pdf (case-insensitive).
+    * Paralelismo via ProcessPoolExecutor; logging para console + arquivo.
+    * Modelo carregado uma vez por worker; pesos baixados uma vez no processo principal.
+    * Dependências (Poppler/Tesseract) detectadas automaticamente, com fallback
+      local do projeto (.poppler/ e .tessdata/).
 
 Uso:
-    python main.py                       # ./pdf -> ./docx (OCR automático)
-    python main.py --no-ocr              # desativa o OCR (só conversão direta)
-    python main.py --ocr-lang eng        # idioma(s) do Tesseract
-    python main.py --force-ocr           # força OCR mesmo com texto nativo
-    python main.py --workers 4 --force --verbose
+    python main.py                       # ./pdf -> ./docx
+    python main.py --dpi 400 --verbose
+    python main.py --ocr-lang eng --workers 4 --force
+    python main.py --device cpu          # força CPU mesmo com GPU disponível
 
-Dependências de sistema (ver README): Tesseract OCR e Ghostscript.
+Dependências de sistema (ver README): Poppler e Tesseract OCR.
+Dependências de IA (ver requirements.txt): doclayout-yolo, torch, huggingface_hub.
 
 Autor: Engenharia HypeTecnologia
 """
@@ -39,71 +38,37 @@ from __future__ import annotations
 
 import argparse
 import logging
-import shutil
-import subprocess
+import os
 import sys
-import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-# ---------------------------------------------------------------------------
-# Configuração e constantes
-# ---------------------------------------------------------------------------
-
-# Diretórios padrão relativos à raiz do projeto (onde este script é executado).
-DEFAULT_SRC_DIR = "pdf"
-DEFAULT_DST_DIR = "docx"
-
-# Nome do arquivo de log gerado na raiz do projeto.
-LOG_FILE_NAME = "conversao.log"
-
-# Extensões.
-SOURCE_SUFFIX = ".pdf"
-TARGET_SUFFIX = ".docx"
-
-# OCR: idioma(s) padrão do Tesseract (documentos em português + termos em inglês).
-DEFAULT_OCR_LANG = "por+eng"
-
-# Uma página é considerada "com texto nativo" se tiver ao menos este nº de
-# caracteres não-espaço. Abaixo disso é tratada como imagem (precisa de OCR).
-DEFAULT_MIN_TEXT_CHARS = 10
+from conversor.config import (
+    DEFAULT_DPI,
+    DEFAULT_DST_DIR,
+    DEFAULT_OCR_LANG,
+    DEFAULT_SRC_DIR,
+    DEFAULT_YOLO_CONF,
+    DEFAULT_YOLO_IMGSZ,
+    LOG_FILE_NAME,
+    SOURCE_SUFFIX,
+    TARGET_SUFFIX,
+    ConversionResult,
+    PipelineConfig,
+    Status,
+)
+from conversor.dependencies import (
+    find_poppler,
+    ml_dependencies_available,
+    resolve_tessdata,
+    tesseract_available,
+)
+from conversor.detector import ensure_weights, resolve_device
+from conversor.pipeline import convert_single
 
 logger = logging.getLogger("conversor_pdf_docx")
-
-
-class Status(str, Enum):
-    """Resultado possível para a conversão de um único arquivo."""
-
-    CONVERTED = "convertido"
-    SKIPPED = "ignorado"
-    FAILED = "falha"
-
-
-@dataclass(frozen=True)
-class OcrConfig:
-    """Configuração do estágio de OCR (imutável e picklável para os workers)."""
-
-    enabled: bool = True
-    lang: str = DEFAULT_OCR_LANG
-    min_text_chars: int = DEFAULT_MIN_TEXT_CHARS
-    force: bool = False  # força OCR mesmo quando há texto nativo
-    available: bool = True  # binários de sistema (Tesseract/Ghostscript) presentes
-
-
-@dataclass(frozen=True)
-class ConversionResult:
-    """Resultado imutável da tentativa de conversão de um arquivo."""
-
-    source: Path
-    target: Path
-    status: Status
-    message: str = ""
-    elapsed: float = 0.0
-    ocr_applied: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -112,15 +77,13 @@ class ConversionResult:
 
 
 def setup_logging(verbose: bool, log_path: Path) -> None:
-    """Configura logging para console e arquivo."""
+    """Configura logging para console (UTF-8) e arquivo."""
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
-    # Garante acentuação correta no console do Windows (evita mojibake em
-    # nomes de arquivo/mensagens com caracteres não-ASCII).
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):  # stdout redirecionado / sem reconfigure
+    except (AttributeError, ValueError):
         pass
 
     fmt = logging.Formatter(
@@ -138,196 +101,8 @@ def setup_logging(verbose: bool, log_path: Path) -> None:
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(fmt)
         logger.addHandler(file_handler)
-    except OSError as exc:  # pragma: no cover - falha rara de I/O de log
+    except OSError as exc:  # pragma: no cover
         logger.warning("Não foi possível abrir o arquivo de log %s: %s", log_path, exc)
-
-
-# ---------------------------------------------------------------------------
-# Dependências de sistema (binários) do OCR
-# ---------------------------------------------------------------------------
-
-
-def find_ghostscript() -> str | None:
-    """Localiza o executável do Ghostscript (nomes variam por plataforma)."""
-    for name in ("gswin64c", "gswin32c", "gs"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
-
-
-def check_ocr_dependencies() -> tuple[bool, list[str]]:
-    """Verifica a presença dos binários de sistema exigidos pelo ocrmypdf.
-
-    Returns:
-        (ok, missing) onde ok é True se tudo está disponível e missing lista os
-        binários ausentes.
-    """
-    missing: list[str] = []
-    if shutil.which("tesseract") is None:
-        missing.append("Tesseract OCR")
-    if find_ghostscript() is None:
-        missing.append("Ghostscript")
-    return (not missing, missing)
-
-
-# ---------------------------------------------------------------------------
-# Passo 0 — detecção de texto nativo
-# ---------------------------------------------------------------------------
-
-
-def pdf_needs_ocr(pdf_path: Path, min_text_chars: int) -> bool:
-    """Determina se o PDF precisa de OCR.
-
-    Retorna True se AO MENOS uma página não possuir texto nativo suficiente
-    (i.e., é uma imagem/scan). Se todas as páginas já têm texto, o OCR é
-    dispensado (fallback do Passo 1) para economizar processamento.
-
-    Em caso de erro na leitura, assume-se que precisa de OCR (comportamento
-    conservador em prol da Regra de Ouro: texto pesquisável).
-    """
-    try:
-        import pymupdf  # PyMuPDF (fitz); dependência transitiva do pdf2docx
-    except ImportError:  # pragma: no cover - pymupdf sempre presente via pdf2docx
-        return True
-
-    try:
-        with pymupdf.open(str(pdf_path)) as doc:
-            if doc.page_count == 0:
-                return False
-            for page in doc:
-                if len(page.get_text().strip()) < min_text_chars:
-                    return True
-        return False
-    except Exception:  # noqa: BLE001 - leitura defensiva
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Passo 1 — pré-processamento OCR (Sandwich PDF)
-# ---------------------------------------------------------------------------
-
-
-def run_ocr(source: Path, sandwich: Path, lang: str) -> None:
-    """Gera um "Sandwich PDF" pesquisável a partir do PDF de origem.
-
-    Executa o ocrmypdf num subprocesso isolado (`python -m ocrmypdf`), o que:
-        * evita o aninhamento frágil de pools de processos no Windows;
-        * isola travamentos do Tesseract do processo worker.
-
-    A flag --skip-text é a chave para a Regra de Ouro: páginas que já contêm
-    texto são deixadas intactas (nunca rasterizadas) e apenas as páginas-imagem
-    recebem a camada de texto invisível por cima, preservando os prints de tela.
-
-    Levanta RuntimeError com a saída de erro do ocrmypdf em caso de falha.
-    """
-    cmd = [
-        sys.executable,
-        "-m",
-        "ocrmypdf",
-        "--skip-text",          # preserva páginas com texto; NÃO destrói imagens
-        "--language",
-        lang,
-        "--output-type",
-        "pdf",                  # sandwich simples (visual original + texto oculto)
-        "--optimize",
-        "0",                    # sem otimização (dispensa jbig2/pngquant opcionais)
-        "--jobs",
-        "1",                    # paralelismo é feito em nível de lote (por arquivo)
-        "--quiet",
-        str(source),
-        str(sandwich),
-    ]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
-        raise RuntimeError(
-            f"ocrmypdf falhou (código {proc.returncode}): {detail[:500]}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Conversão de um único arquivo (executada em processo worker)
-# ---------------------------------------------------------------------------
-
-
-def convert_single(source: Path, target: Path, ocr: OcrConfig) -> ConversionResult:
-    """Executa o pipeline híbrido (OCR condicional + conversão) para um arquivo.
-
-    Ponto de entrada de cada processo worker. Captura qualquer exceção e a
-    converte em ConversionResult(FAILED), garantindo que uma falha isolada nunca
-    derrube o lote. Usa um diretório temporário (tempfile) para o Sandwich PDF,
-    removido no finally tanto em caso de sucesso quanto de falha.
-    """
-    from pdf2docx import Converter  # import local: overhead fica no worker
-
-    start = time.perf_counter()
-    tmp_dir: Path | None = None
-    converter: "Converter | None" = None
-    ocr_applied = False
-
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source_for_conversion = source
-
-        # ---- Passo 0 + Passo 1: OCR condicional -------------------------------
-        if ocr.enabled and (ocr.force or pdf_needs_ocr(source, ocr.min_text_chars)):
-            if not ocr.available:
-                raise RuntimeError(
-                    "OCR necessário (PDF sem texto nativo), mas Tesseract/"
-                    "Ghostscript não estão instalados. Veja o README ou use "
-                    "--no-ocr."
-                )
-            tmp_dir = Path(tempfile.mkdtemp(prefix="ocr_sandwich_"))
-            sandwich = tmp_dir / f"{source.stem}.pdf"
-            run_ocr(source, sandwich, ocr.lang)
-            source_for_conversion = sandwich
-            ocr_applied = True
-
-        # ---- Passo 2: conversão PDF -> DOCX -----------------------------------
-        converter = Converter(str(source_for_conversion))
-        converter.convert(str(target), multi_processing=False)
-
-        elapsed = time.perf_counter() - start
-        return ConversionResult(
-            source=source,
-            target=target,
-            status=Status.CONVERTED,
-            message="com OCR" if ocr_applied else "texto nativo",
-            elapsed=elapsed,
-            ocr_applied=ocr_applied,
-        )
-    except Exception as exc:  # noqa: BLE001 - fail-safe intencional por arquivo
-        elapsed = time.perf_counter() - start
-        # Remove um .docx parcial/corrompido que possa ter sido criado.
-        try:
-            if target.exists():
-                target.unlink()
-        except OSError:
-            pass
-        return ConversionResult(
-            source=source,
-            target=target,
-            status=Status.FAILED,
-            message=f"{type(exc).__name__}: {exc}",
-            elapsed=elapsed,
-            ocr_applied=ocr_applied,
-        )
-    finally:
-        if converter is not None:
-            try:
-                converter.close()
-            except Exception:  # noqa: BLE001 - close best-effort
-                pass
-        # Limpeza garantida do Sandwich PDF temporário (sucesso OU falha).
-        if tmp_dir is not None:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -336,10 +111,9 @@ def convert_single(source: Path, target: Path, ocr: OcrConfig) -> ConversionResu
 
 
 def discover_pdfs(src_dir: Path) -> list[Path]:
-    """Retorna a lista de PDFs válidos no diretório de origem (filtro estrito)."""
+    """Retorna os PDFs válidos no diretório de origem (filtro estrito)."""
     if not src_dir.is_dir():
         raise NotADirectoryError(f"Diretório de origem não encontrado: {src_dir}")
-
     pdfs = [
         item
         for item in src_dir.iterdir()
@@ -359,7 +133,6 @@ def _plan_jobs(
     """Separa PDFs entre trabalhos a executar e já ignorados (idempotência)."""
     jobs: list[tuple[Path, Path]] = []
     skipped: list[ConversionResult] = []
-
     for pdf in pdfs:
         target = target_path_for(pdf, dst_dir)
         if target.exists() and not force:
@@ -373,7 +146,6 @@ def _plan_jobs(
             )
         else:
             jobs.append((pdf, target))
-
     return jobs, skipped
 
 
@@ -383,11 +155,7 @@ def _plan_jobs(
 
 
 def run_batch(
-    src_dir: Path,
-    dst_dir: Path,
-    workers: int,
-    force: bool,
-    ocr: OcrConfig,
+    src_dir: Path, dst_dir: Path, workers: int, force: bool, cfg: PipelineConfig
 ) -> list[ConversionResult]:
     """Orquestra a conversão em lote de todos os PDFs do diretório de origem."""
     pdfs = discover_pdfs(src_dir)
@@ -396,31 +164,22 @@ def run_batch(
         return []
 
     dst_dir.mkdir(parents=True, exist_ok=True)
-
     jobs, results = _plan_jobs(pdfs, dst_dir, force)
 
     for skipped in results:
         logger.info("[IGNORADO] %s (destino já existe)", skipped.source.name)
 
     logger.info(
-        "Encontrados %d PDF(s) | a converter: %d | ignorados: %d | workers: %d | OCR: %s",
-        len(pdfs),
-        len(jobs),
-        len(results),
-        workers,
-        "ligado" if ocr.enabled else "desligado",
+        "Encontrados %d PDF(s) | a converter: %d | ignorados: %d | workers: %d | DPI: %d",
+        len(pdfs), len(jobs), len(results), workers, cfg.dpi,
     )
-
     if not jobs:
         return results
 
-    # ProcessPoolExecutor: isola cada arquivo em seu próprio processo (protege o
-    # lote contra crashes de baixo nível da engine/Tesseract) e paraleliza o
-    # trabalho CPU-bound. O OCR roda em subprocesso próprio dentro de cada worker.
     completed = 0
     with ProcessPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(convert_single, source, target, ocr): source
+            executor.submit(convert_single, source, target, cfg): source
             for source, target in jobs
         }
         for future in as_completed(future_map):
@@ -434,7 +193,6 @@ def run_batch(
                     status=Status.FAILED,
                     message=f"Processo worker falhou: {type(exc).__name__}: {exc}",
                 )
-
             completed += 1
             _log_result(result, completed, len(jobs))
             results.append(result)
@@ -443,24 +201,16 @@ def run_batch(
 
 
 def _log_result(result: ConversionResult, index: int, total: int) -> None:
-    """Registra o resultado de uma conversão individual no log."""
+    """Registra o resultado de uma conversão individual."""
     progress = f"[{index}/{total}]"
     if result.status is Status.CONVERTED:
         logger.info(
-            "%s [OK] %s -> %s (%s, %.2fs)",
-            progress,
-            result.source.name,
-            result.target.name,
-            result.message,
-            result.elapsed,
+            "%s [OK] %s -> %s (%d pág., %s, %.2fs)",
+            progress, result.source.name, result.target.name,
+            result.pages, result.message, result.elapsed,
         )
     elif result.status is Status.FAILED:
-        logger.error(
-            "%s [FALHA] %s :: %s",
-            progress,
-            result.source.name,
-            result.message,
-        )
+        logger.error("%s [FALHA] %s :: %s", progress, result.source.name, result.message)
 
 
 def summarize(results: list[ConversionResult]) -> dict[Status, int]:
@@ -477,10 +227,9 @@ def summarize(results: list[ConversionResult]) -> dict[Status, int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Constrói o parser de argumentos de linha de comando."""
     parser = argparse.ArgumentParser(
         prog="main.py",
-        description="Converte em lote PDFs para DOCX com OCR híbrido (sandwich).",
+        description="Converte em lote PDFs para DOCX editável por Document Layout Analysis.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--src", type=Path, default=Path(DEFAULT_SRC_DIR),
@@ -491,24 +240,35 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Nº de processos paralelos (padrão: nº de CPUs).")
     parser.add_argument("--force", action="store_true",
                         help="Reprocessa mesmo que o .docx de destino já exista.")
-    parser.add_argument("--no-ocr", dest="ocr", action="store_false",
-                        help="Desativa o pré-processamento OCR (só conversão direta).")
-    parser.add_argument("--force-ocr", action="store_true",
-                        help="Força OCR mesmo em PDFs que já possuem texto nativo.")
+    parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
+                        help="Resolução de rasterização das páginas.")
     parser.add_argument("--ocr-lang", default=DEFAULT_OCR_LANG,
                         help="Idioma(s) do Tesseract (ex.: 'por', 'eng', 'por+eng').")
-    parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS,
-                        help="Mín. de caracteres p/ considerar uma página como texto nativo.")
+    parser.add_argument("--min-conf", type=int, default=40,
+                        help="Confiança mínima (0-100) para aceitar uma palavra do OCR.")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Hardware de inferência: auto (GPU se houver), cpu ou cuda.")
+    parser.add_argument("--yolo-conf", type=float, default=DEFAULT_YOLO_CONF,
+                        help="Confiança mínima de detecção do YOLO (0-1).")
+    parser.add_argument("--yolo-imgsz", type=int, default=DEFAULT_YOLO_IMGSZ,
+                        help="Tamanho de inferência do modelo (px).")
     parser.add_argument("--verbose", action="store_true",
                         help="Habilita logs de nível DEBUG no console.")
     return parser
 
 
-def resolve_workers(requested: int | None, job_count: int) -> int:
-    """Determina o nº efetivo de workers (nunca mais que o nº de arquivos)."""
-    import os
+def resolve_workers(requested: int | None, job_count: int, device: str) -> int:
+    """Determina o nº efetivo de workers (nunca mais que o nº de arquivos).
 
-    base = requested if (requested and requested > 0) else (os.cpu_count() or 1)
+    Em GPU, cada worker carrega uma cópia do modelo na mesma VRAM; por isso, se o
+    usuário não pedir explicitamente, limitamos a 1 worker para evitar OOM de VRAM.
+    """
+    if requested and requested > 0:
+        base = requested
+    elif device.startswith("cuda"):
+        base = 1
+    else:
+        base = os.cpu_count() or 1
     return max(1, min(base, max(1, job_count)))
 
 
@@ -520,27 +280,69 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(args.verbose, project_root / LOG_FILE_NAME)
 
     logger.info("=" * 70)
-    logger.info("Conversor PDF -> DOCX (OCR híbrido) iniciado")
+    logger.info("Conversor PDF -> DOCX (Document Layout Analysis) iniciado")
     logger.info("Origem: %s | Destino: %s", args.src.resolve(), args.dst.resolve())
 
-    # Pré-verificação das dependências de sistema do OCR (não-fatal): arquivos
-    # que realmente precisarem de OCR falharão individualmente com mensagem clara.
-    ocr_available = True
-    if args.ocr:
-        ocr_available, missing = check_ocr_dependencies()
-        if not ocr_available:
-            logger.warning(
-                "Dependência(s) de sistema ausente(s): %s. PDFs sem texto nativo "
-                "irão falhar. Instale-as (ver README) ou rode com --no-ocr.",
-                ", ".join(missing),
-            )
+    # --- Dependências de sistema -------------------------------------------
+    poppler_path = find_poppler(project_root)
+    if poppler_path is None:
+        logger.error(
+            "Poppler não encontrado (necessário para o pdf2image). Instale-o e "
+            "adicione ao PATH, ou coloque uma cópia portátil em .poppler/ (ver README)."
+        )
+        return 2
+    logger.info("Poppler: %s", poppler_path)
 
-    ocr = OcrConfig(
-        enabled=args.ocr,
-        lang=args.ocr_lang,
-        min_text_chars=args.min_text_chars,
-        force=args.force_ocr,
-        available=ocr_available,
+    if not tesseract_available():
+        logger.error(
+            "Tesseract OCR não encontrado no PATH. Instale-o (ver README) — é "
+            "obrigatório para a leitura do texto."
+        )
+        return 2
+
+    tessdata, lang_missing = resolve_tessdata(args.ocr_lang, project_root)
+    if tessdata:
+        logger.info("Dados de idioma do sistema incompletos; usando fallback local: %s", tessdata)
+    if lang_missing:
+        logger.warning(
+            "Idioma(s) de OCR ausente(s): %s. Instale o(s) traineddata "
+            "correspondente(s) (ver README) ou ajuste --ocr-lang.",
+            ", ".join(lang_missing),
+        )
+
+    # --- Dependências de IA (Visão Computacional) --------------------------
+    ml_ok, ml_missing = ml_dependencies_available()
+    if not ml_ok:
+        logger.error(
+            "Dependências de IA ausentes: %s. Instale-as com "
+            "'pip install -r requirements.txt' (ver README).",
+            ", ".join(ml_missing),
+        )
+        return 2
+
+    # Resolve e registra o hardware de inferência UMA vez (os workers herdam via cfg).
+    device, device_desc = resolve_device(args.device)
+    logger.info("Hardware de inferência: %s", device_desc)
+
+    # Baixa os pesos do modelo no processo principal (uma vez; sem corrida entre workers).
+    try:
+        logger.info("Preparando modelo DocLayout-YOLO (download no 1º uso pode demorar)...")
+        model_path = ensure_weights()
+        logger.info("Pesos do modelo: %s", model_path)
+    except Exception as exc:  # noqa: BLE001 - erro de rede/HF é fatal para o lote
+        logger.error("Falha ao obter os pesos do modelo: %s: %s", type(exc).__name__, exc)
+        return 2
+
+    cfg = PipelineConfig(
+        dpi=args.dpi,
+        ocr_lang=args.ocr_lang,
+        tessdata=tessdata,
+        poppler_path=poppler_path,
+        min_conf=args.min_conf,
+        device=device,
+        model_path=model_path,
+        yolo_conf=args.yolo_conf,
+        yolo_imgsz=args.yolo_imgsz,
     )
 
     try:
@@ -549,22 +351,21 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 2
 
-    workers = resolve_workers(args.workers, len(pdfs_preview))
+    workers = resolve_workers(args.workers, len(pdfs_preview), device)
 
     start = time.perf_counter()
-    results = run_batch(args.src, args.dst, workers=workers, force=args.force, ocr=ocr)
+    results = run_batch(args.src, args.dst, workers=workers, force=args.force, cfg=cfg)
     elapsed = time.perf_counter() - start
 
     summary = summarize(results)
-    ocr_count = sum(1 for r in results if r.ocr_applied)
+    total_text = sum(r.text_blocks for r in results)
+    total_images = sum(r.image_blocks for r in results)
     logger.info("-" * 70)
     logger.info(
-        "Concluído em %.2fs | Convertidos: %d (c/ OCR: %d) | Ignorados: %d | Falhas: %d",
-        elapsed,
-        summary[Status.CONVERTED],
-        ocr_count,
-        summary[Status.SKIPPED],
-        summary[Status.FAILED],
+        "Concluído em %.2fs | Convertidos: %d | Ignorados: %d | Falhas: %d | "
+        "Blocos de texto: %d | Imagens: %d",
+        elapsed, summary[Status.CONVERTED], summary[Status.SKIPPED],
+        summary[Status.FAILED], total_text, total_images,
     )
     logger.info("=" * 70)
 

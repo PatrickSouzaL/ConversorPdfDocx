@@ -15,6 +15,13 @@ docx/*.docx
 # Arquivos de origem (documentos internos) — não versionar
 pdf/*.pdf
 
+# Dados de idioma do Tesseract (binários grandes, específicos da máquina).
+# Fallback local usado quando o idioma não está instalado no sistema.
+.tessdata/
+
+# Poppler portátil (binário do pdf2image; grande, específico da máquina).
+.poppler/
+
 # Ferramentas de agentes / IDE
 .agents/
 .claude/

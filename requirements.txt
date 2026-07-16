@@ -1,11 +1,24 @@
-# Conversor PDF -> DOCX com OCR híbrido
+# Conversor PDF -> DOCX por Document Layout Analysis (ML / DocLayout-YOLO)
 
-# Engine de conversão que preserva layout, tabelas e imagens.
-# Traz o PyMuPDF (fitz) como dependência transitiva (usado também na
-# detecção de texto nativo).
-pdf2docx==0.5.13
+# Rasterização
+pdf2image==1.17.0
 
-# Pré-processamento OCR ("Sandwich PDF"): encapsula o Tesseract e usa o
-# Ghostscript. ATENÇÃO: exige os binários de sistema Tesseract OCR e
-# Ghostscript instalados separadamente (ver README).
-ocrmypdf==17.8.0
+# Inteligência Artificial (Visão Computacional / detecção de layout)
+# DocLayout-YOLO = YOLOv10 ajustado em documentos. Vendoriza o ultralytics no
+# próprio namespace (não instale ultralytics separadamente, para evitar conflito).
+doclayout-yolo>=0.0.3
+huggingface_hub>=0.24
+# torch é puxado pelo doclayout-yolo. Em CPU o wheel padrão basta; para GPU,
+# instale antes o wheel CUDA apropriado (ver https://pytorch.org/get-started).
+torch
+
+# OCR
+pytesseract==0.3.13
+
+# Word
+python-docx==1.2.0
+
+# Tratamento de imagens e arrays
+opencv-python
+numpy
+Pillow
