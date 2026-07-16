@@ -204,10 +204,11 @@ def _log_result(result: ConversionResult, index: int, total: int) -> None:
     """Registra o resultado de uma conversão individual."""
     progress = f"[{index}/{total}]"
     if result.status is Status.CONVERTED:
+        per_page = result.elapsed / result.pages if result.pages else 0.0
         logger.info(
-            "%s [OK] %s -> %s (%d pág., %s, %.2fs)",
+            "%s [OK] %s -> %s (%d pág., %s, %.2fs, %.2fs/pág.)",
             progress, result.source.name, result.target.name,
-            result.pages, result.message, result.elapsed,
+            result.pages, result.message, result.elapsed, per_page,
         )
     elif result.status is Status.FAILED:
         logger.error("%s [FALHA] %s :: %s", progress, result.source.name, result.message)
@@ -272,12 +273,32 @@ def resolve_workers(requested: int | None, job_count: int, device: str) -> int:
     return max(1, min(base, max(1, job_count)))
 
 
+def load_project_env(project_root: Path) -> bool:
+    """Carrega o `.env` do projeto (ex.: HF_HOME, YOLO_CONFIG_DIR) se disponível.
+
+    Feito ANTES de qualquer import de huggingface_hub/torch (que ocorrem sob
+    demanda), para que o cache dos modelos vá para o diretório configurado. As
+    variáveis são propagadas automaticamente aos workers (herança de ambiente).
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return False
+    return load_dotenv(dotenv_path=project_root / ".env")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada. Retorna o exit code do processo."""
     args = build_parser().parse_args(argv)
 
     project_root = Path.cwd()
+    env_loaded = load_project_env(project_root)
     setup_logging(args.verbose, project_root / LOG_FILE_NAME)
+    if env_loaded:
+        logger.info(
+            "Variáveis de ambiente carregadas de .env (HF_HOME=%s).",
+            os.environ.get("HF_HOME", "<padrão>"),
+        )
 
     logger.info("=" * 70)
     logger.info("Conversor PDF -> DOCX (Document Layout Analysis) iniciado")
@@ -333,6 +354,24 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Falha ao obter os pesos do modelo: %s: %s", type(exc).__name__, exc)
         return 2
 
+    try:
+        pdfs_preview = discover_pdfs(args.src)
+    except NotADirectoryError as exc:
+        logger.error("%s", exc)
+        return 2
+
+    workers = resolve_workers(args.workers, len(pdfs_preview), device)
+
+    # Otimização de CPU: divide os núcleos entre os workers para o torch de cada um
+    # não brigar pelos mesmos threads (oversubscription). Em GPU não se aplica.
+    cpu_threads: int | None = None
+    if device == "cpu":
+        cpu_threads = max(1, (os.cpu_count() or 1) // workers)
+        logger.info(
+            "Inferência em CPU: %d worker(s) × %d thread(s) torch cada (evita oversubscription).",
+            workers, cpu_threads,
+        )
+
     cfg = PipelineConfig(
         dpi=args.dpi,
         ocr_lang=args.ocr_lang,
@@ -343,15 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         model_path=model_path,
         yolo_conf=args.yolo_conf,
         yolo_imgsz=args.yolo_imgsz,
+        cpu_threads=cpu_threads,
     )
-
-    try:
-        pdfs_preview = discover_pdfs(args.src)
-    except NotADirectoryError as exc:
-        logger.error("%s", exc)
-        return 2
-
-    workers = resolve_workers(args.workers, len(pdfs_preview), device)
 
     start = time.perf_counter()
     results = run_batch(args.src, args.dst, workers=workers, force=args.force, cfg=cfg)
@@ -360,12 +392,25 @@ def main(argv: list[str] | None = None) -> int:
     summary = summarize(results)
     total_text = sum(r.text_blocks for r in results)
     total_images = sum(r.image_blocks for r in results)
+
+    # Tempo médio por página (soma do tempo de CPU dos arquivos convertidos /
+    # total de páginas) — métrica de comparação entre versões, independente do
+    # paralelismo (usa o tempo de processamento, não o wall-clock do lote).
+    converted = [r for r in results if r.status is Status.CONVERTED]
+    total_pages = sum(r.pages for r in converted)
+    cpu_time = sum(r.elapsed for r in converted)
+    per_page = cpu_time / total_pages if total_pages else 0.0
+
     logger.info("-" * 70)
     logger.info(
         "Concluído em %.2fs | Convertidos: %d | Ignorados: %d | Falhas: %d | "
         "Blocos de texto: %d | Imagens: %d",
         elapsed, summary[Status.CONVERTED], summary[Status.SKIPPED],
         summary[Status.FAILED], total_text, total_images,
+    )
+    logger.info(
+        "Páginas processadas: %d | Tempo médio: %.2fs/página (device=%s)",
+        total_pages, per_page, device,
     )
     logger.info("=" * 70)
 

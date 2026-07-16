@@ -75,6 +75,7 @@ class PipelineConfig:
     model_path: str | None = None     # caminho local dos pesos (pré-baixados no main)
     yolo_conf: float = DEFAULT_YOLO_CONF
     yolo_imgsz: int = DEFAULT_YOLO_IMGSZ
+    cpu_threads: int | None = None    # threads do torch por worker em CPU (None = padrão do torch)
 
     # --- OCR das regiões de texto ---
     min_conf: int = 40                # confiança mínima (0-100) p/ aceitar palavra do OCR

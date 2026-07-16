@@ -12,6 +12,9 @@ huggingface_hub>=0.24
 # instale antes o wheel CUDA apropriado (ver https://pytorch.org/get-started).
 torch
 
+# Configuração de ambiente (.env: HF_HOME / YOLO_CONFIG_DIR p/ cache dos modelos)
+python-dotenv>=1.0
+
 # OCR
 pytesseract==0.3.13
 

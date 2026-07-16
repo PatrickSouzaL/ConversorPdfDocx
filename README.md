@@ -86,6 +86,22 @@ reduzimos aos nossos dois domínios essenciais (ver `conversor/config.py`):
 > no processo principal (sem corrida entre workers) e cada worker carrega o modelo
 > em memória **uma única vez** (singleton lazy por processo), nunca por arquivo.
 
+**Otimização de CPU (threads):** ao rodar em CPU com vários workers, cada processo
+fixa `torch.set_num_threads(núcleos ÷ workers)`. Sem isso, todos os workers tentam
+usar todos os núcleos ao mesmo tempo (*oversubscription*), o que degrada o
+throughput. Para ajustar o balanço, use `--workers` (menos workers = mais threads
+por worker). O log final reporta o **tempo médio por página**, útil para comparar
+configurações.
+
+**Cache dos modelos (`.env`):** se houver um arquivo `.env` na raiz (e o
+`python-dotenv` instalado), ele é carregado no início. Use-o para direcionar o
+cache dos pesos para fora do `AppData`:
+
+```dotenv
+HF_HOME="./.models_cache/huggingface"
+YOLO_CONFIG_DIR="./.models_cache/yolo"
+```
+
 ## Arquitetura
 
 Código modular, no pacote `conversor/`, com responsabilidades isoladas:
@@ -114,6 +130,8 @@ Código modular, no pacote `conversor/`, com responsabilidades isoladas:
   CUDA do PyTorch **antes** do `requirements.txt` (ver <https://pytorch.org/get-started>).
 - **Acesso à internet** no primeiro uso, para baixar os pesos do modelo (cacheados
   depois).
+- **`.env` (opcional):** `python-dotenv` já está no `requirements.txt`; se houver um
+  `.env` na raiz, ele controla o diretório de cache dos modelos (ver "O modelo de IA").
 
 ## Instalação
 
@@ -232,6 +250,16 @@ ConversorPdfDocx/
   feche-os antes de reprocessar com `--force`.
 
 ## Histórico de versões
+
+### v3.1.0 — Otimização de CPU e cache configurável
+- **Threads do torch por worker:** em CPU, cada worker fixa `núcleos ÷ workers`
+  threads, eliminando o *oversubscription* do ProcessPool (ganho de throughput).
+- **`.env` carregado de fato** (`python-dotenv`): `HF_HOME`/`YOLO_CONFIG_DIR` passam
+  a direcionar o cache dos modelos, propagados automaticamente aos workers.
+- **Tempo por página** reportado no log (por arquivo e média global), para benchmark.
+- **Avaliado o YOLO26** (NMS-free, mais rápido em CPU) e **mantido o DocLayout-YOLO**:
+  o `yolo26n.pt` é treinado no COCO e não detecta regiões de documento, então trocá-lo
+  quebraria o DLA. A aceleração veio de threads/cache, sem trocar o modelo.
 
 ### v3.0.0 — Visão Computacional (DocLayout-YOLO)
 - **Substitui a heurística por ML:** a segmentação/classificação de blocos por
