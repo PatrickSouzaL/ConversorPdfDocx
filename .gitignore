@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Artefatos de conversão (arquivos gerados)
+docx/*.docx
+
+# Arquivos de origem (documentos internos) — não versionar
+pdf/*.pdf
+
+# Ferramentas de agentes / IDE
+.agents/
+.claude/
+
+# SO / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Manter as pastas de trabalho no repositório
+!docx/.gitkeep
+!pdf/.gitkeep

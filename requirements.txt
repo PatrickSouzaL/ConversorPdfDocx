@@ -1,0 +1,4 @@
+# Conversor PDF -> DOCX
+# Engine de conversão que preserva layout, tabelas e imagens.
+# pdf2docx traz o PyMuPDF (fitz) como dependência transitiva.
+pdf2docx==0.5.13
